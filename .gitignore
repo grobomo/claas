@@ -1,0 +1,12 @@
+config/
+archive/
+*.log
+.env
+*.pem
+*.kubeconfig
+dashboard/output/
+dashboard/logs/
+node_modules/
+__pycache__/
+.test-results/
+SESSION_STATE.md
