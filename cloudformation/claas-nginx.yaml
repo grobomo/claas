@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  claas nginx reverse proxy — single public entry point for the CCC fleet.
+  Self-signed TLS on 443, proxies to dispatcher services. t3.micro spot instance.
+
+Parameters:
+  InstanceName:
+    Type: String
+    Default: claas-nginx
+    Description: Name tag for the instance
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: t3.micro is plenty for nginx proxy
+
+  SpotMaxPrice:
+    Type: String
+    Default: '0.005'
+    Description: Max spot price (t3.micro on-demand ~$0.0104, spot ~$0.003)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: claude-portable-key
+    Description: SSH keypair for maintenance access
+
+  DispatcherPrivateIP:
+    Type: String
+    Default: 172.31.26.102
+    Description: Private IP of the dispatcher instance (for proxy upstream)
+
+Mappings:
+  RegionAMI:
+    us-east-2:
+      AMI: ami-0ea3c35c5c3284d82
+
+Resources:
+  NginxEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-eip'
+        - Key: Project
+          Value: claas
+
+  NginxEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref NginxInstance
+      AllocationId: !GetAtt NginxEIP.AllocationId
+
+  NginxLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${InstanceName}-lt'
+      LaunchTemplateData:
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            MaxPrice: !Ref SpotMaxPrice
+            SpotInstanceType: persistent
+            InstanceInterruptionBehavior: stop
+
+  NginxInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NginxLaunchTemplate
+        Version: !GetAtt NginxLaunchTemplate.LatestVersionNumber
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      ImageId: !FindInMap [RegionAMI, !Ref 'AWS::Region', AMI]
+      SecurityGroupIds:
+        - !ImportValue claas-sg-nginx
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 10
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+        - Key: Project
+          Value: claas
+        - Key: Component
+          Value: nginx-proxy
+        - Key: ManagedBy
+          Value: cloudformation
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/claas-nginx-init.log) 2>&1
+          echo "[init] Starting nginx proxy init at $(date -u)"
+
+          # --- Install nginx ---
+          apt-get update -y
+          apt-get install -y nginx
+
+          # --- Generate self-signed TLS cert ---
+          mkdir -p /etc/nginx/ssl
+          openssl req -x509 -nodes -days 365 \
+            -newkey rsa:2048 \
+            -keyout /etc/nginx/ssl/nginx.key \
+            -out /etc/nginx/ssl/nginx.crt \
+            -subj "/CN=claas-dashboard/O=claas"
+
+          # --- Configure nginx ---
+          DISPATCHER_IP="${DispatcherPrivateIP}"
+
+          cat > /etc/nginx/sites-available/claas <<'NGINX_CONF'
+          # claas reverse proxy — routes to dispatcher services
+          log_format json_combined escape=json
+            '{'
+              '"time":"$time_iso8601",'
+              '"remote_addr":"$remote_addr",'
+              '"request":"$request",'
+              '"status":$status,'
+              '"body_bytes_sent":$body_bytes_sent,'
+              '"request_time":$request_time,'
+              '"upstream_response_time":"$upstream_response_time",'
+              '"http_user_agent":"$http_user_agent"'
+            '}';
+
+          upstream dashboard {
+              server DISPATCHER_IP_PLACEHOLDER:8082;
+          }
+
+          upstream dispatcher_api {
+              server DISPATCHER_IP_PLACEHOLDER:8080;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name _;
+
+              ssl_certificate /etc/nginx/ssl/nginx.crt;
+              ssl_certificate_key /etc/nginx/ssl/nginx.key;
+
+              access_log /var/log/nginx/access.log json_combined;
+
+              # Dashboard (root)
+              location / {
+                  proxy_pass http://dashboard;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              # Dispatcher health
+              location /health {
+                  proxy_pass http://dispatcher_api/health;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Dispatcher API endpoints
+              location /api/ {
+                  proxy_pass http://dispatcher_api/api/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Relay endpoints
+              location /relay/ {
+                  proxy_pass http://dispatcher_api/relay/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Dashboard explicit path
+              location /dash {
+                  proxy_pass http://dashboard/dash;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Nginx status (local only, exposed for monitoring)
+              location /nginx-status {
+                  stub_status on;
+                  allow all;
+              }
+          }
+
+          # HTTP redirect to HTTPS
+          server {
+              listen 80;
+              server_name _;
+              return 301 https://$host$request_uri;
+          }
+          NGINX_CONF
+
+          # Replace placeholder with actual dispatcher IP
+          sed -i "s/DISPATCHER_IP_PLACEHOLDER/$DISPATCHER_IP/g" /etc/nginx/sites-available/claas
+
+          # Fix indentation (heredoc inside CF adds spaces)
+          sed -i 's/^          //' /etc/nginx/sites-available/claas
+
+          # Enable site, disable default
+          ln -sf /etc/nginx/sites-available/claas /etc/nginx/sites-enabled/claas
+          rm -f /etc/nginx/sites-enabled/default
+
+          # Test and start
+          nginx -t
+          systemctl enable nginx
+          systemctl restart nginx
+
+          echo "[init] Nginx proxy ready at $(date -u)"
+
+Outputs:
+  NginxPublicIP:
+    Description: Public IP of the nginx proxy (dashboard URL)
+    Value: !Ref NginxEIP
+    Export:
+      Name: claas-nginx-ip
+  NginxInstanceId:
+    Description: EC2 instance ID
+    Value: !Ref NginxInstance

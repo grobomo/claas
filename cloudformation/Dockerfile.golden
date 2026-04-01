@@ -1,0 +1,68 @@
+# Dockerfile.golden — Baked golden image for CCC workers.
+# Everything is pre-installed. Only secrets come from Secrets Manager at runtime.
+#
+# Build context: this file + config-bundle output + golden-entrypoint.sh
+# Build command: docker build -f Dockerfile.golden -t claas/worker .
+#
+# The base image (claude-portable) must be built first on the same host.
+
+ARG BASE_IMAGE=claude-portable:latest
+FROM ${BASE_IMAGE}
+
+# Switch to root for system-level changes
+USER root
+
+# ── Pin Claude version + disable auto-update ─────────────────────────────────
+# v2.1.77 is the last known version that honors --dangerously-skip-permissions
+# and bypassPermissions mode. Newer versions may prompt interactively, which
+# deadlocks headless workers running claude -p.
+ENV CLAUDE_AUTO_UPDATE=0
+ENV CLAUDE_CODE_DISABLE_AUTOUPDATER=1
+
+# ── Bake config-bundle (hooks, rules, skills, settings, CLAUDE.md) ─────────────
+# Config-bundle is extracted to /tmp/config-bundle/ before build
+COPY config-bundle/ /tmp/config-bundle/
+RUN if [ -f /tmp/config-bundle/install.js ]; then \
+      cd /tmp/config-bundle && \
+      HOME=/home/claude node install.js . && \
+      rm -rf /tmp/config-bundle; \
+    fi
+
+# ── Bake onboarding bypass ──────────────────────────────────────────────────────
+# Skip Claude's first-run wizard and ToS prompt
+RUN mkdir -p /home/claude/.claude && \
+    echo '{"hasCompletedOnboarding":true,"completedOnboardingAt":"2026-01-01T00:00:00.000Z"}' \
+      > /home/claude/.claude/.claude.json && \
+    echo '{"hasAcknowledgedDisclaimer":true}' \
+      > /home/claude/.claude/settings.local.json
+
+# ── Bake git identity ──────────────────────────────────────────────────────────
+RUN git config --global user.name "claude-portable" && \
+    git config --global user.email "noreply@claude-portable"
+
+# ── Bake DISPLAY env for Chrome/Blueprint ───────────────────────────────────────
+RUN echo 'export DISPLAY=:99' >> /home/claude/.bashrc && \
+    echo 'export CHROME_FLAGS="--no-sandbox --disable-gpu --disable-dev-shm-usage"' >> /home/claude/.bashrc
+
+# ── Bake MCP bundle (Blueprint MCP + mcp-manager) ───────────────────────────────
+# Source copied without node_modules — npm install runs here for Linux-native deps
+COPY mcp-bundle/ /tmp/mcp-bundle/
+RUN bash /tmp/mcp-bundle/install-mcp.sh && rm -rf /tmp/mcp-bundle
+
+# ── Copy golden entrypoint ──────────────────────────────────────────────────────
+COPY golden-entrypoint.sh /opt/golden-entrypoint.sh
+RUN chmod +x /opt/golden-entrypoint.sh
+
+# ── Fix ownership ──────────────────────────────────────────────────────────────
+RUN chown -R claude:claude /home/claude
+
+# ── Switch back to claude user ──────────────────────────────────────────────────
+USER claude
+WORKDIR /home/claude/workspace
+
+ENV CLAUDE_CONFIG_DIR=/home/claude/.claude
+ENV HOME=/home/claude
+ENV DISPLAY=:99
+
+ENTRYPOINT ["/opt/golden-entrypoint.sh"]
+CMD ["sleep", "infinity"]

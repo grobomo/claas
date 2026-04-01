@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  claas CCC worker — spot EC2 with Docker + Claude Code.
+  Each worker runs a single Docker container (claude-portable) that
+  accepts tasks via SSH from the dispatcher. Heartbeat file at
+  /workspace/.heartbeat.json enables non-intrusive health monitoring.
+
+Parameters:
+  WorkerName:
+    Type: String
+    Description: >
+      Unique name for this worker (e.g. claas-worker-dev, claas-worker-1).
+      Used for Name tag, hostname, and heartbeat identification.
+
+  InstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues: [t3.medium, t3.large, t3.xlarge, m5.large, m5.xlarge]
+    Description: >
+      t3.large (2 vCPU, 8GB) is the minimum for Claude Code + Chrome.
+      Use t3.xlarge for parallel tasks or heavy analysis workloads.
+
+  SpotMaxPrice:
+    Type: String
+    Default: '0.05'
+    Description: Max spot price (t3.large on-demand ~$0.0835, spot ~$0.025)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: claude-portable-key
+    Description: SSH keypair — shared across all claas instances
+
+  DockerImage:
+    Type: String
+    Default: ''
+    Description: >
+      Pre-built Docker image to pull (e.g. from ECR). If empty, builds
+      from the claude-portable repo cloned in userdata. Building takes
+      ~10 min but avoids ECR dependency.
+
+Resources:
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${WorkerName}-lt'
+      LaunchTemplateData:
+        # Design decision: spot for cost (80% savings). Acceptable risk for
+        # hackathon — if reclaimed, dispatcher resubmits the task.
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            MaxPrice: !Ref SpotMaxPrice
+            SpotInstanceType: persistent
+            InstanceInterruptionBehavior: stop
+
+  WorkerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      # Latest Ubuntu 22.04 AMI (us-east-2)
+      ImageId: !FindInMap [RegionAMI, !Ref 'AWS::Region', AMI]
+      IamInstanceProfile: !ImportValue claas-instance-profile
+      SecurityGroupIds:
+        - !ImportValue claas-sg-worker
+      # Design decision: 50GB root volume. Docker images + repos + build
+      # artifacts need space. gp3 for consistent IOPS.
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Ref WorkerName
+        - Key: Project
+          Value: claas
+        - Key: Component
+          Value: ccc-worker
+        - Key: ManagedBy
+          Value: cloudformation
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          # --- Log everything for debugging ---
+          exec > >(tee /var/log/claas-init.log) 2>&1
+          echo "[init] Starting claas worker init at $(date -u)"
+
+          # --- Install Docker CE ---
+          # Design decision: install Docker from official repo, not snap.
+          # Snap Docker has permission issues with volume mounts.
+          apt-get update -y
+          apt-get install -y ca-certificates curl gnupg
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          chmod a+r /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+          usermod -aG docker ubuntu
+          systemctl enable docker && systemctl start docker
+
+          # --- Install AWS CLI v2 (Ubuntu 24.04 doesn't ship with aws) ---
+          echo "[init] Installing AWS CLI v2..."
+          apt-get install -y unzip
+          curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip
+          unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip
+
+          # --- Get Docker image ---
+          cd /home/ubuntu
+          mkdir -p /home/ubuntu/workspace
+          chown ubuntu:ubuntu /home/ubuntu/workspace
+
+          DOCKER_IMAGE="${DockerImage}"
+          if [ -n "$DOCKER_IMAGE" ]; then
+            # ECR pull — golden image with everything baked in
+            echo "[init] Pulling golden image from ECR..."
+            aws ecr get-login-password --region ${AWS::Region} | \
+              docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+            docker pull "$DOCKER_IMAGE"
+            IMAGE_NAME="$DOCKER_IMAGE"
+          else
+            # Fallback: build from S3 source (AWS CLI already installed above)
+            echo "[init] Building from source..."
+            aws s3 cp s3://claas-state-${AWS::AccountId}/source/claude-portable.tar.gz /tmp/claude-portable.tar.gz
+            tar -xzf /tmp/claude-portable.tar.gz -C /home/ubuntu/
+            cd claude-portable
+            docker build -t claude-portable:latest . 2>&1 | tail -20
+            IMAGE_NAME="claude-portable:latest"
+          fi
+
+          # --- Start container ---
+          # Golden image uses golden-entrypoint.sh (fetches secrets, starts services).
+          # Source build uses tail -f /dev/null (needs manual bootstrap).
+          docker run -d \
+            --name claude-portable \
+            --hostname ${WorkerName} \
+            -e WORKER_NAME=${WorkerName} \
+            -e AWS_DEFAULT_REGION=${AWS::Region} \
+            -v /home/ubuntu/workspace:/home/claude/workspace \
+            -v /home/ubuntu/.ssh:/home/claude/.ssh:ro \
+            --restart unless-stopped \
+            "$IMAGE_NAME" \
+            sleep infinity
+
+          # --- Heartbeat script (runs on HOST, writes to shared volume) ---
+          # Design decision: heartbeat on host, not in container. If container
+          # crashes, heartbeat still reports the error state.
+          # Written via python to avoid Fn::Sub parsing bash dollar-brace variables.
+          python3 -c "
+          import base64, sys
+          script = '''#!/bin/bash
+          WORKER_NAME=\"${WorkerName}\"
+          while true; do
+            CS=\$(docker inspect -f '{{.State.Status}}' claude-portable 2>/dev/null || echo missing)
+            if [ \"\$CS\" = \"running\" ]; then
+              PID=\$(docker exec claude-portable pgrep -f 'claude -p ' 2>/dev/null | head -1)
+              [ -n \"\$PID\" ] && ST=running || ST=idle
+            else
+              ST=error; PID=0
+            fi
+            [ -z \"\$PID\" ] && PID=0
+            TS=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            DF=\$(df -h /home/ubuntu/workspace | tail -1 | awk '{print \$4}')
+            UT=\$(awk '{print \$1}' /proc/uptime)
+            echo \"{\\\"worker\\\":\\\"\$WORKER_NAME\\\",\\\"status\\\":\\\"\$ST\\\",\\\"container\\\":\\\"\$CS\\\",\\\"pid\\\":\$PID,\\\"timestamp\\\":\\\"\$TS\\\",\\\"disk_free\\\":\\\"\$DF\\\",\\\"uptime\\\":\\\"\$UT\\\"}\" > /home/ubuntu/workspace/.heartbeat.json
+            sleep 60
+          done
+          '''
+          sys.stdout.write(script)
+          " > /home/ubuntu/heartbeat.sh
+          chmod +x /home/ubuntu/heartbeat.sh
+          nohup /home/ubuntu/heartbeat.sh > /var/log/heartbeat.log 2>&1 &
+
+          echo "[init] Worker ${WorkerName} ready at $(date -u)"
+
+  # Elastic IP for stable public address (spot instances lose IPs on stop/start)
+  WorkerEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref WorkerInstance
+      Tags:
+        - Key: Name
+          Value: !Sub '${WorkerName}-eip'
+        - Key: Project
+          Value: claas
+
+Mappings:
+  # Ubuntu 22.04 LTS AMIs by region
+  # Design decision: Ubuntu over Amazon Linux because claude-portable
+  # Dockerfile is Debian-based — matching host OS reduces friction.
+  RegionAMI:
+    us-east-2:
+      AMI: ami-0cb91c7de36eed2cb
+    us-east-1:
+      AMI: ami-0c7217cdde317cfec
+
+Outputs:
+  InstanceId:
+    Value: !Ref WorkerInstance
+  PublicIP:
+    Value: !Ref WorkerEIP
+  WorkerName:
+    Value: !Ref WorkerName
