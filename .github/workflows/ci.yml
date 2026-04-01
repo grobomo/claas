@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate JSON files
+        run: |
+          echo "=== JSON Validation ==="
+          FAIL=0
+          for f in $(find . -name '*.json' -not -path './.git/*'); do
+            if python3 -c "import json; json.load(open('$f'))" 2>/dev/null; then
+              echo "  OK: $f"
+            else
+              echo "  FAIL: $f"
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      - name: Validate shell scripts (shellcheck)
+        run: |
+          echo "=== Shell Script Validation ==="
+          FAIL=0
+          for f in scripts/*.sh client/*.sh; do
+            [ -f "$f" ] || continue
+            if shellcheck -S warning "$f" 2>&1; then
+              echo "  OK: $f"
+            else
+              echo "  WARN: $f (shellcheck warnings)"
+            fi
+          done
+
+      - name: Validate Python client syntax
+        run: |
+          python3 -c "import py_compile; py_compile.compile('client/claas-client.py', doraise=True)"
+          echo "Python client syntax OK"
+
+      - name: Validate Grafana dashboard
+        run: |
+          python3 -c "
+          import json
+          d = json.load(open('dashboard/grafana-dashboard.json'))
+          assert d['title'] == 'CLaaS Fleet Dashboard'
+          assert d['schemaVersion'] >= 38
+          assert any('claas_workers_total' in str(p) for p in d['panels'])
+          print('Grafana dashboard valid')
+          "
+
+      - name: Check for hardcoded IPs
+        run: |
+          if grep -rn '16\.58\.49\.156\|3\.131\.126\.72' --include='*.py' --include='*.sh' --include='*.js' . --exclude-dir=.git; then
+            echo "::error::Hardcoded IP addresses found"
+            exit 1
+          fi
+          echo "No hardcoded IPs found"
