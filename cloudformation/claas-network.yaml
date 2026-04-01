@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  claas network layer  - security groups for CCC fleet.
+  Design: nginx is the only public-facing port (443). Dispatcher and workers
+  allow inbound only from nginx SG + SSH from Joel's IP. Workers have no
+  direct internet inbound at all except through nginx.
+
+Parameters:
+  JoelIP:
+    Type: String
+    Default: 172.13.104.26/32
+    Description: >
+      Joel's public IP for SSH access. Update this if IP changes.
+      Only Joel can SSH directly  - everyone else goes through nginx.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-055dc6de20b7df1e4
+    Description: Default VPC in us-east-2 (shared account)
+
+Resources:
+  # --- Nginx security group: the only public-facing entry point ---
+  # Design decision: single entry point reduces attack surface.
+  # Only 443 from internet. SSH from Joel's IP for maintenance.
+  SGNginx:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: claas-nginx-proxy
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # HTTPS from anywhere  - this is the dashboard/health entry point
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTPS (dashboard, health, audit)
+        # SSH from Joel only  - for nginx maintenance
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref JoelIP
+          Description: SSH from Joel IP
+      Tags:
+        - Key: Name
+          Value: claas-sg-nginx
+        - Key: Project
+          Value: claas
+
+  # --- Internal security group: dispatcher and services behind nginx ---
+  # Design decision: allows all traffic from nginx SG so nginx can proxy
+  # to any port. Also allows SSH from Joel for direct debugging.
+  SGInternal:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: claas-internal
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # All traffic from nginx proxy
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref SGNginx
+          Description: All traffic from nginx proxy
+        # SSH from Joel for direct debugging
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref JoelIP
+          Description: SSH from Joel IP
+      Tags:
+        - Key: Name
+          Value: claas-sg-internal
+        - Key: Project
+          Value: claas
+
+  # --- Worker security group: no public inbound at all ---
+  # Design decision: workers are pull-only. Dispatcher SSHs TO workers
+  # (outbound from dispatcher, inbound to worker from internal SG).
+  # Workers push to GitHub via outbound HTTPS. No reason for any
+  # internet-initiated connection to reach a worker.
+  SGWorker:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: claas-worker
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # SSH from internal SG (dispatcher SSHs to workers)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref SGInternal
+          Description: SSH from dispatcher
+        # SSH from Joel for debugging
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref JoelIP
+          Description: SSH from Joel IP
+      Tags:
+        - Key: Name
+          Value: claas-sg-worker
+        - Key: Project
+          Value: claas
+
+  # --- Self-referencing rule: workers can SSH to each other ---
+  # Needed if workers need to communicate (future: peer review)
+  SGWorkerSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SGWorker
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref SGWorker
+      Description: Worker-to-worker SSH (peer tasks)
+
+  # --- Self-referencing rule: internal instances can talk to each other ---
+  SGInternalSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SGInternal
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref SGInternal
+      Description: Internal-to-internal (dispatcher components)
+
+Outputs:
+  SGNginxId:
+    Value: !Ref SGNginx
+    Export:
+      Name: claas-sg-nginx
+  SGInternalId:
+    Value: !Ref SGInternal
+    Export:
+      Name: claas-sg-internal
+  SGWorkerId:
+    Value: !Ref SGWorker
+    Export:
+      Name: claas-sg-worker

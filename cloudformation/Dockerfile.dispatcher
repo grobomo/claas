@@ -1,0 +1,67 @@
+# Dockerfile.dispatcher — Baked dispatcher image with all services pre-installed.
+# Includes: CLaaS API (patched git-dispatch.py), dashboard, teams poller, nginx proxy.
+# Only secrets come from Secrets Manager at runtime.
+#
+# Build context: claas/ repo root
+# Build command: docker build -f cloudformation/Dockerfile.dispatcher -t claas/dispatcher .
+#
+# The base image (claude-portable) must be built first on the same host.
+
+ARG BASE_IMAGE=claude-portable:latest
+FROM ${BASE_IMAGE}
+
+USER root
+
+# ── Pin Claude version + disable auto-update ─────────────────────────────────
+ENV CLAUDE_AUTO_UPDATE=0
+ENV CLAUDE_CODE_DISABLE_AUTOUPDATER=1
+
+# ── Bake patched git-dispatch.py (CLaaS API + persistence + worker_name fix) ─
+COPY scripts/fleet/git-dispatch-patched.py /opt/claude-portable/scripts/git-dispatch.py
+
+# ── Bake dashboard (central-server.js + auth.js) ─────────────────────────────
+RUN mkdir -p /opt/claude-portable/dashboard
+COPY dashboard/central-server.js /opt/claude-portable/dashboard/central-server.js
+COPY dashboard/auth.js /opt/claude-portable/dashboard/auth.js
+
+# ── Bake teams poller ────────────────────────────────────────────────────────
+RUN mkdir -p /opt/teams-poller/data
+COPY scripts/fleet/aws-teams-poller.py /opt/teams-poller/poller.py
+COPY scripts/fleet/aws-coconut-worker.py /opt/teams-poller/worker.py
+COPY scripts/fleet/poller-supervisor.sh /opt/teams-poller/supervisor.sh
+RUN chmod +x /opt/teams-poller/supervisor.sh && \
+    ln -sf poller.py /opt/teams-poller/aws-teams-poller.py && \
+    ln -sf worker.py /opt/teams-poller/aws-coconut-worker.py
+
+# ── Bake dispatcher entrypoint ────────────────────────────────────────────────
+COPY scripts/fleet/dispatcher-entrypoint.sh /opt/dispatcher-entrypoint.sh
+RUN chmod +x /opt/dispatcher-entrypoint.sh
+
+# ── Bake onboarding bypass + git identity ────────────────────────────────────
+RUN mkdir -p /home/claude/.claude && \
+    echo '{"hasCompletedOnboarding":true,"completedOnboardingAt":"2026-01-01T00:00:00.000Z"}' \
+      > /home/claude/.claude/.claude.json && \
+    echo '{"hasAcknowledgedDisclaimer":true}' \
+      > /home/claude/.claude/settings.local.json && \
+    git config --global user.name "claude-portable" && \
+    git config --global user.email "noreply@claude-portable"
+
+# ── Relay repo init dir ──────────────────────────────────────────────────────
+RUN mkdir -p /data/relay-repo
+
+# ── Fix ownership ────────────────────────────────────────────────────────────
+RUN chown -R claude:claude /home/claude /opt/teams-poller /opt/claude-portable/dashboard /data
+
+USER claude
+WORKDIR /opt/claude-portable
+
+ENV CLAUDE_CONFIG_DIR=/home/claude/.claude
+ENV HOME=/home/claude
+ENV POLLER_HOME=/opt/teams-poller
+ENV CONTINUOUS_CLAUDE_ENABLED=0
+ENV DISPATCHER_DASHBOARD_PORT=8080
+
+EXPOSE 8080 8082
+
+ENTRYPOINT ["/opt/dispatcher-entrypoint.sh"]
+CMD ["sleep", "infinity"]

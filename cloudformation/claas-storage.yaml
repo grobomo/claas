@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  claas storage + IAM — S3 bucket for state/audit/heartbeats,
+  IAM instance profile for EC2 instances (S3 + Bedrock access).
+
+Resources:
+  # --- State bucket: audit logs, heartbeats, dispatcher state ---
+  # Design decision: single bucket with prefixes instead of multiple buckets.
+  # Simpler IAM, simpler lifecycle rules, one place to look.
+  StateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub claas-state-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+          # Audit logs: keep 30 days (enough for hackathon + review)
+          - Id: audit-log-expiry
+            Prefix: audit-logs/
+            Status: Enabled
+            ExpirationInDays: 30
+          # Heartbeats: keep 7 days (ephemeral status data)
+          - Id: heartbeat-expiry
+            Prefix: heartbeats/
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: claas
+        - Key: Component
+          Value: state-storage
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- IAM role for all claas EC2 instances ---
+  # Design decision: single role for all instance types. Workers and
+  # dispatcher need the same S3 + Bedrock access. Principle of least
+  # privilege would split these, but for a hackathon, simplicity wins.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: claas-instance-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: claas-s3-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Full access to claas state bucket
+              - Effect: Allow
+                Action: s3:*
+                Resource:
+                  - !GetAtt StateBucket.Arn
+                  - !Sub ${StateBucket.Arn}/*
+              # Access to boothapp sessions bucket (existing, us-east-1)
+              - Effect: Allow
+                Action: s3:*
+                Resource:
+                  - !Sub arn:aws:s3:::boothapp-sessions-${AWS::AccountId}
+                  - !Sub arn:aws:s3:::boothapp-sessions-${AWS::AccountId}/*
+        - PolicyName: claas-bedrock-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Bedrock for Claude analysis (fallback when no API key)
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+        - PolicyName: claas-secrets-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read secrets for golden image entrypoint (OAuth, GitHub token, API key)
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:claas/*
+        - PolicyName: claas-ec2-describe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Dispatcher needs DescribeInstances for fleet monitor (resolve IPs, stop idle workers)
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                Resource: '*'
+        - PolicyName: claas-ecr-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Pull golden images from ECR
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/claas/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: claas-instance-profile
+      Roles:
+        - !Ref InstanceRole
+
+Outputs:
+  StateBucketName:
+    Value: !Ref StateBucket
+    Export:
+      Name: claas-state-bucket
+  InstanceProfileArn:
+    Value: !GetAtt InstanceProfile.Arn
+    Export:
+      Name: claas-instance-profile-arn
+  InstanceProfileName:
+    Value: !Ref InstanceProfile
+    Export:
+      Name: claas-instance-profile
