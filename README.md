@@ -64,12 +64,26 @@ open http://localhost:8080/dashboard
 For users who can't install Claude locally. A lightweight TUI connects to CLaaS,
 the worker runs Claude in AWS, and a local agent handles file operations.
 
+### Local Mode (no fleet required)
+
+Run everything on your machine — no AWS, no fleet, no config:
+
 ```bash
-# One-time setup
+pip install flask
+python client/thin-client/claas-tui.py --local
+```
+
+This starts the session API in-process and dispatches to local `claude -p`.
+Great for development, demos, and single-user setups.
+
+### Fleet Mode (multi-user)
+
+```bash
+# One-time setup (fleet mode)
 python client/thin-client/claas-tui.py --init    # creates ~/.claas/config.json
 # Edit config: set server URL, allowed paths
 
-# Start interactive session
+# Start interactive session against a CLaaS fleet
 python client/thin-client/claas-tui.py --server https://claas.example.com
 
 # Resume a previous session
@@ -191,6 +205,7 @@ All via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `CLAAS_DISPATCH_MODE` | `api` | `api` (fleet) or `local` (claude -p subprocess) |
 | `CLAAS_DATA_DIR` | `/data` | Persistent storage |
 | `CLAAS_TARGET_REPO` | `altarr/boothapp` | Default target repo |
 | `CLAAS_TARGET_BRANCH` | `main` | Default base branch |

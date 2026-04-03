@@ -299,6 +299,66 @@ def stream_response(config, session_id):
         print(f"  {RED}Stream error: {e}{RESET}")
 
 
+def _start_local_server(config):
+    """Start the session API server in-process for local mode.
+
+    Sets CLAAS_DISPATCH_MODE=local so prompts run via local claude -p.
+    The server runs in a background thread on a free port.
+    """
+    import importlib.machinery
+
+    # Find session API script relative to this file
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    session_api_path = os.path.join(script_dir, "claas-session-api.py")
+    if not os.path.exists(session_api_path):
+        # Try relative to TUI location (for claas repo layout)
+        alt_path = os.path.join(os.path.dirname(script_dir), "scripts", "claas-session-api.py")
+        if os.path.exists(alt_path):
+            session_api_path = alt_path
+        else:
+            print(f"{RED}Cannot find claas-session-api.py{RESET}")
+            print(f"  Expected at: {session_api_path}")
+            sys.exit(1)
+
+    # Set env for local mode
+    data_dir = os.path.expanduser("~/.claas/data")
+    os.environ["CLAAS_DISPATCH_MODE"] = "local"
+    os.environ["CLAAS_DATA_DIR"] = data_dir
+    os.makedirs(data_dir, exist_ok=True)
+
+    # Find a free port
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    os.environ["CLAAS_SESSION_API_URL"] = f"http://127.0.0.1:{port}"
+    config["server"] = f"http://127.0.0.1:{port}"
+
+    # Load and start the session API
+    loader = importlib.machinery.SourceFileLoader("session_api", session_api_path)
+    mod = loader.load_module()
+    app = mod.create_app()
+
+    server_thread = threading.Thread(
+        target=lambda: app.run(host="127.0.0.1", port=port, use_reloader=False),
+        daemon=True
+    )
+    server_thread.start()
+
+    # Wait for server to be ready
+    import urllib.request
+    for _ in range(20):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/sessions", timeout=1)
+            break
+        except Exception:
+            time.sleep(0.25)
+
+    print(f"  {DIM}Local server on :{port} (claude -p mode){RESET}")
+
+
 def _init_config():
     """Generate ~/.claas/config.json template."""
     config_dir = os.path.expanduser("~/.claas")
@@ -339,6 +399,8 @@ def main():
     parser.add_argument("--working-dir", help="Working directory")
     parser.add_argument("--init", action="store_true",
                         help="Create ~/.claas/config.json template and exit")
+    parser.add_argument("--local", action="store_true",
+                        help="Local mode: start session API in-process, dispatch to local claude -p")
     args = parser.parse_args()
 
     if args.init:
@@ -351,6 +413,10 @@ def main():
     if args.working_dir:
         config["working_dir"] = args.working_dir
         config["allowed_paths"] = [args.working_dir]
+
+    # Local mode: start session API in-process
+    if args.local:
+        _start_local_server(config)
 
     # Create or resume session
     if args.session:
