@@ -59,6 +59,49 @@ curl http://localhost:8080/api/v1/task/<task-id>
 open http://localhost:8080/dashboard
 ```
 
+## Thin Client (Remote Claude)
+
+For users who can't install Claude locally. A lightweight TUI connects to CLaaS,
+the worker runs Claude in AWS, and a local agent handles file operations.
+
+```bash
+# One-time setup
+python client/thin-client/claas-tui.py --init    # creates ~/.claas/config.json
+# Edit config: set server URL, allowed paths
+
+# Start interactive session
+python client/thin-client/claas-tui.py --server https://claas.example.com
+
+# Resume a previous session
+python client/thin-client/claas-tui.py --session abc12345
+```
+
+```
+  CLaaS Remote Shell v1.0
+  Server:  https://claas.example.com
+  Session: a1b2c3d4
+
+> Add error handling to src/api/routes.js
+
+  [agent] read_file: /home/user/project/src/api/routes.js
+  [agent] write_file: /home/user/project/src/api/routes.js
+
+  Done. Added try-catch to 5 routes with proper error responses.
+
+> /audit    # review what the agent executed
+> /workers  # see fleet status
+> /new      # start fresh session
+```
+
+**Security model:**
+- No Claude on user machine -- only TUI + agent (Python, zero deps)
+- Agent only executes whitelisted operations (`read_file`, `list_dir`, `search_files`, `write_file`, `run_script`)
+- Path restrictions -- file ops limited to configured directories
+- Path traversal protection (realpath resolution)
+- Full audit log (local JSONL + server-side) for security team review
+
+See [Session API endpoints](#session-api) for the full API.
+
 ## Client Libraries
 
 ### Python (zero dependencies)
@@ -100,6 +143,22 @@ bash scripts/claas-task-status.sh <task-id>
 | POST | `/api/v1/autoscale` | Update auto-scale config |
 | GET | `/dashboard` | Live web dashboard |
 | GET | `/metrics` | Prometheus metrics |
+
+### Session API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/session` | Create interactive session |
+| POST | `/api/v1/session/:id/prompt` | Send user prompt to worker |
+| GET | `/api/v1/session/:id/stream` | SSE stream of response chunks |
+| GET | `/api/v1/session/:id/status` | Session state |
+| DELETE | `/api/v1/session/:id` | End session |
+| GET | `/api/v1/sessions` | List all sessions |
+| POST | `/api/v1/session/:id/command` | Worker requests local op (blocks until agent responds) |
+| GET | `/api/v1/session/:id/commands` | Agent polls for pending commands |
+| POST | `/api/v1/session/:id/result` | Agent returns command result |
+| GET | `/api/v1/session/:id/audit` | Audit log for session |
+| GET | `/api/v1/audit` | Full audit log (last 500) |
 
 See [docs/api-reference.md](docs/api-reference.md) for full details with curl examples.
 

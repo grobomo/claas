@@ -29,13 +29,26 @@ Client -> Nginx (HTTPS) -> Dispatcher (CLaaS API :8080) -> Workers (EC2, claude 
 ## Directory Layout
 
 ```
-dashboard/         -- Web UI (single-file HTML dashboard + Node.js admin)
-client/            -- Python + Bash client libraries
-cloudformation/    -- AWS infrastructure templates
-scripts/           -- API, operational scripts, worker scripts
-docs/              -- API reference, architecture, quick-start, AWS deploy
-specs/             -- Feature specs (SpecKit format)
+dashboard/              -- Web UI (single-file HTML dashboard + Node.js admin)
+client/                 -- Client libraries
+  claas-client.py       -- Python SDK (submit, wait, status)
+  claas-client.sh       -- Bash CLI wrapper
+  thin-client/          -- Thin client TUI + local agent
+    claas-tui.py        -- Terminal UI + agent (zero deps, single file)
+cloudformation/         -- AWS infrastructure templates
+scripts/                -- API, operational scripts, worker scripts
+  claas-api-v2.py       -- Main CLaaS API (Flask)
+  claas-session-api.py  -- Session API for thin client (Flask blueprint)
+  claas-worker-run.sh   -- Worker-side task execution
+  test/                 -- Test suites
+docs/                   -- API reference, architecture, quick-start, AWS deploy
+specs/                  -- Feature specs (SpecKit format)
 ```
+
+## Architecture Split
+
+CLaaS is the **user experience layer** — TUI, session API, client libs, dashboard, docs.
+The compute layer (Dockerfiles, worker images, fleet management) lives in **claude-portable**.
 
 ## Key Scripts
 
