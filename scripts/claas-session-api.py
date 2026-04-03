@@ -45,6 +45,8 @@ CLAAS_API_URL = os.environ.get("CLAAS_API_URL", "http://localhost:8080")
 SESSION_API_URL = os.environ.get("CLAAS_SESSION_API_URL", "http://localhost:8081")
 # SSH config for direct worker dispatch (fallback / interactive mode)
 SSH_KEY_DIR = os.environ.get("CLAAS_SSH_KEY_DIR", "/tmp/ccc-keys")
+# Dispatch mode: "api" (CLaaS v2 fleet) or "local" (subprocess claude -p)
+DISPATCH_MODE = os.environ.get("CLAAS_DISPATCH_MODE", "api")
 
 
 def _save_sessions():
@@ -454,13 +456,28 @@ def _http_get(url):
 
 
 def _dispatch_session_prompt(session_id, prompt):
-    """Dispatch a session prompt to a CCC worker via CLaaS v2 API.
+    """Dispatch a session prompt to a worker.
 
-    Flow:
-    1. Build system prompt (command channel instructions) + user prompt
-    2. Submit to CLaaS v2 /api/v1/submit (picks worker via LRU)
-    3. Poll task status, stream worker output back as response_chunks
-    4. Worker uses curl to command channel for local ops (agent handles them)
+    Two modes:
+    - "api": Submit to CLaaS v2 fleet (EC2 workers)
+    - "local": Run claude -p as a local subprocess (no fleet needed)
+    """
+    session = _sessions.get(session_id)
+    if not session:
+        return
+
+    if DISPATCH_MODE == "local":
+        _dispatch_local(session_id, prompt)
+    else:
+        _dispatch_api(session_id, prompt)
+
+
+def _dispatch_local(session_id, prompt):
+    """Run claude -p locally as a subprocess. No fleet required.
+
+    The system prompt teaches Claude about the command channel API,
+    so it can request local file operations via curl to this server.
+    This mode is ideal for development, demos, and single-user setups.
     """
     session = _sessions.get(session_id)
     if not session:
@@ -468,13 +485,105 @@ def _dispatch_session_prompt(session_id, prompt):
 
     system_prompt = _build_system_prompt(session_id, session)
     full_prompt = _build_full_prompt(session, prompt)
+    combined_prompt = f"{system_prompt}\n\n---\n\n{full_prompt}"
 
-    # Combine system prompt + user prompt for claude -p
-    combined_prompt = f"""{system_prompt}
+    with _session_lock:
+        session["status"] = "dispatched"
+        session["worker"] = "local"
+        session["response_chunks"].append({
+            "type": "status",
+            "content": "Running locally (claude -p)...",
+            "timestamp": time.time(),
+        })
 
----
+    _audit("dispatch_local", session_id, prompt_length=len(prompt))
 
-{full_prompt}"""
+    try:
+        # Write prompt to temp file to avoid shell quoting issues
+        import tempfile
+        prompt_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="claas-prompt-"
+        )
+        prompt_file.write(combined_prompt)
+        prompt_file.close()
+
+        # Run claude -p with the prompt file as stdin
+        result = subprocess.run(
+            ["claude", "-p"],
+            stdin=open(prompt_file.name),
+            capture_output=True, text=True,
+            timeout=600,  # 10 minute timeout
+        )
+
+        os.unlink(prompt_file.name)
+
+        output = result.stdout or ""
+        if result.stderr:
+            output += "\n" + result.stderr[-1000:]
+
+        with _session_lock:
+            if output:
+                session["response_chunks"].append({
+                    "type": "text",
+                    "content": output,
+                    "timestamp": time.time(),
+                })
+            if result.returncode != 0:
+                session["response_chunks"].append({
+                    "type": "error",
+                    "content": f"claude -p exited with code {result.returncode}",
+                    "timestamp": time.time(),
+                })
+            session["messages"].append({
+                "role": "assistant",
+                "content": output or "(no output)",
+                "timestamp": time.time(),
+            })
+            session["response_complete"] = True
+            session["status"] = "active"
+            _save_sessions()
+
+    except subprocess.TimeoutExpired:
+        with _session_lock:
+            session["response_chunks"].append({
+                "type": "error",
+                "content": "Local claude -p timed out after 10 minutes",
+                "timestamp": time.time(),
+            })
+            session["response_complete"] = True
+            session["status"] = "active"
+            _save_sessions()
+    except FileNotFoundError:
+        with _session_lock:
+            session["response_chunks"].append({
+                "type": "error",
+                "content": "claude command not found. Install Claude Code: npm install -g @anthropic-ai/claude-code",
+                "timestamp": time.time(),
+            })
+            session["response_complete"] = True
+            session["status"] = "active"
+            _save_sessions()
+    except Exception as e:
+        with _session_lock:
+            session["response_chunks"].append({
+                "type": "error",
+                "content": f"Local dispatch error: {e}",
+                "timestamp": time.time(),
+            })
+            session["response_complete"] = True
+            session["status"] = "active"
+            _save_sessions()
+
+
+def _dispatch_api(session_id, prompt):
+    """Dispatch via CLaaS v2 fleet API (original mode)."""
+    session = _sessions.get(session_id)
+    if not session:
+        return
+
+    system_prompt = _build_system_prompt(session_id, session)
+    full_prompt = _build_full_prompt(session, prompt)
+    combined_prompt = f"{system_prompt}\n\n---\n\n{full_prompt}"
 
     with _session_lock:
         session["response_chunks"].append({
@@ -626,8 +735,25 @@ def register_with_claas(claas_app):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="CLaaS Session API")
+    parser.add_argument("--local", action="store_true",
+                        help="Local mode: run claude -p as subprocess instead of fleet dispatch")
+    parser.add_argument("--port", type=int, default=8081, help="Port (default: 8081)")
+    parser.add_argument("--data-dir", help="Data directory for persistence")
+    args = parser.parse_args()
+
+    if args.local:
+        DISPATCH_MODE = "local"
+    if args.data_dir:
+        DATA_DIR = Path(args.data_dir)
+        SESSIONS_FILE = DATA_DIR / "claas-sessions.json"
+        AUDIT_FILE = DATA_DIR / "claas-session-audit.jsonl"
+
     app = create_app()
-    print(f"CLaaS Session API on :8081 ({len(_sessions)} sessions)")
-    print(f"  CLaaS v2 API: {CLAAS_API_URL}")
+    mode_label = "LOCAL (claude -p)" if DISPATCH_MODE == "local" else f"FLEET ({CLAAS_API_URL})"
+    print(f"CLaaS Session API on :{args.port} ({len(_sessions)} sessions)")
+    print(f"  Mode: {mode_label}")
     print(f"  Session API URL (for workers): {SESSION_API_URL}")
-    app.run(host="0.0.0.0", port=8081)
+    print(f"  Data: {DATA_DIR}")
+    app.run(host="0.0.0.0", port=args.port)
