@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLaaS v2 Dashboard</title>
+<style>
+:root {
+  --bg: #0d1117; --card: #161b22; --border: #30363d;
+  --text: #c9d1d9; --dim: #8b949e; --accent: #58a6ff;
+  --green: #3fb950; --yellow: #d29922; --red: #f85149; --purple: #bc8cff;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; }
+.header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.header h1 { font-size: 20px; font-weight: 600; }
+.header h1 span { color: var(--accent); }
+.header .status { display: flex; gap: 16px; font-size: 13px; color: var(--dim); }
+.conn-indicator { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.conn-indicator.connected { background: var(--green); animation: pulse 2s infinite; }
+.conn-indicator.disconnected { background: var(--red); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 24px; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--dim); margin-bottom: 12px; }
+.full-width { grid-column: 1 / -1; }
+
+/* Stats bar */
+.stats { display: flex; gap: 24px; flex-wrap: wrap; }
+.stat { text-align: center; }
+.stat .value { font-size: 28px; font-weight: 700; }
+.stat .label { font-size: 11px; color: var(--dim); text-transform: uppercase; }
+.stat.idle .value { color: var(--green); }
+.stat.busy .value { color: var(--yellow); }
+.stat.unresponsive .value { color: var(--red); }
+.stat.pending .value { color: var(--purple); }
+
+/* Worker grid */
+.workers { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+.worker-card { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+.worker-card.idle { border-left: 3px solid var(--green); }
+.worker-card.busy { border-left: 3px solid var(--yellow); }
+.worker-card.unresponsive { border-left: 3px solid var(--red); }
+.worker-card .name { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+.worker-card .status-badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; display: inline-block; }
+.worker-card .status-badge.idle { background: rgba(63,185,80,0.15); color: var(--green); }
+.worker-card .status-badge.busy { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.worker-card .status-badge.unresponsive { background: rgba(248,81,73,0.15); color: var(--red); }
+.worker-card .meta { font-size: 12px; color: var(--dim); margin-top: 6px; }
+.worker-card .task-preview { font-size: 11px; color: var(--accent); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Task table */
+.task-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.task-table th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--dim); font-weight: 500; }
+.task-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.task-table tr:hover { background: rgba(88,166,255,0.05); }
+.task-status { font-size: 11px; padding: 2px 8px; border-radius: 10px; display: inline-block; }
+.task-status.pending { background: rgba(188,140,255,0.15); color: var(--purple); }
+.task-status.dispatched { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.task-status.completed { background: rgba(63,185,80,0.15); color: var(--green); }
+.task-status.failed { background: rgba(248,81,73,0.15); color: var(--red); }
+.task-prompt { max-width: 300px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-output { max-width: 250px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; color: var(--dim); }
+
+/* Heartbeat timeline */
+.hb-timeline { display: flex; flex-direction: column; gap: 6px; }
+.hb-row { display: flex; align-items: center; gap: 8px; }
+.hb-row .label { font-size: 12px; min-width: 100px; white-space: nowrap; }
+.hb-bar { height: 20px; flex: 1; background: var(--bg); border-radius: 4px; overflow: hidden; position: relative; }
+.hb-segment { height: 100%; position: absolute; }
+.hb-segment.active { background: var(--green); }
+.hb-segment.idle { background: rgba(63,185,80,0.3); }
+.hb-segment.silent { background: var(--red); opacity: 0.4; }
+.hb-age { font-size: 11px; color: var(--dim); min-width: 60px; text-align: right; }
+
+/* Event feed */
+.event-feed { max-height: 300px; overflow-y: auto; font-size: 12px; font-family: 'Cascadia Code', 'Fira Code', monospace; }
+.event-feed .entry { padding: 4px 0; border-bottom: 1px solid rgba(48,54,61,0.5); display: flex; gap: 8px; }
+.event-feed .ts { color: var(--dim); white-space: nowrap; min-width: 70px; }
+.event-feed .etype { font-weight: 600; min-width: 120px; }
+.event-feed .etype.submitted { color: var(--purple); }
+.event-feed .etype.dispatched { color: var(--yellow); }
+.event-feed .etype.completed { color: var(--green); }
+.event-feed .etype.failed { color: var(--red); }
+.event-feed .etype.worker_registered { color: var(--accent); }
+.event-feed .etype.heartbeat { color: var(--dim); }
+.event-feed .detail { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Cost */
+.cost-row { display: flex; gap: 20px; align-items: baseline; }
+.cost-row .amount { font-size: 22px; font-weight: 700; color: var(--green); }
+.cost-row .period { font-size: 11px; color: var(--dim); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>CLaaS</span> v2 Dashboard</h1>
+  <div class="status">
+    <span><span class="conn-indicator" id="conn-dot"></span> <span id="conn-text">Connecting...</span></span>
+    <span id="last-update"></span>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card full-width">
+    <div class="stats" id="stats">
+      <div class="stat idle"><div class="value" id="stat-idle">-</div><div class="label">Idle</div></div>
+      <div class="stat busy"><div class="value" id="stat-busy">-</div><div class="label">Busy</div></div>
+      <div class="stat unresponsive"><div class="value" id="stat-unresponsive">-</div><div class="label">Unresponsive</div></div>
+      <div class="stat pending"><div class="value" id="stat-pending">-</div><div class="label">Pending</div></div>
+      <div class="stat"><div class="value" id="stat-completed">-</div><div class="label">Completed</div></div>
+      <div class="stat"><div class="value" style="color:var(--red)" id="stat-failed">-</div><div class="label">Failed</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Workers</h2>
+    <div class="workers" id="worker-grid"></div>
+  </div>
+
+  <div class="card">
+    <h2>Fleet Cost &amp; Auto-Scale</h2>
+    <div class="cost-row">
+      <div><span class="amount" id="cost-hourly">$0.00</span><span class="period">/hr</span></div>
+      <div><span class="amount" id="cost-daily" style="color:var(--yellow)">$0.00</span><span class="period">/day est</span></div>
+      <div style="font-size:12px;color:var(--dim)"><span id="cost-workers">0</span> running</div>
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--dim)">
+      <div>Budget: <span id="cost-budget">$50</span>/day | Hard stop: <span id="cost-hardstop">$100</span>/day</div>
+      <div>Cost/task: <span id="cost-per-task" style="color:var(--accent)">$0.00</span></div>
+      <div style="margin-top:6px">
+        Auto-scale: <span id="autoscale-status" style="font-weight:600">off</span>
+        <span style="margin-left:12px">Min: <span id="autoscale-min">2</span> | Max: <span id="autoscale-max">10</span></span>
+        <span id="autoscale-action" style="margin-left:12px;color:var(--yellow)"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card full-width">
+    <h2>Tasks</h2>
+    <table class="task-table">
+      <thead><tr><th>ID</th><th>Status</th><th>Prompt</th><th>Worker</th><th>Duration</th><th>Output</th></tr></thead>
+      <tbody id="task-body"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Heartbeat Timeline</h2>
+    <div class="hb-timeline" id="hb-timeline"></div>
+  </div>
+
+  <div class="card">
+    <h2>Event Feed</h2>
+    <div class="event-feed" id="event-feed"></div>
+  </div>
+</div>
+
+<script>
+const API_BASE = window.location.origin + '/api/v1';
+
+function ago(ts) {
+  if (!ts) return '-';
+  const s = Math.floor(Date.now()/1000 - ts);
+  if (s < 0) return 'just now';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  return Math.floor(s/3600) + 'h ago';
+}
+function duration(start, end) {
+  if (!start) return '-';
+  const s = Math.floor((end || Date.now()/1000) - start);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s||''; return d.innerHTML; }
+
+function renderWorkers(workers) {
+  const grid = document.getElementById('worker-grid');
+  const entries = Object.values(workers).sort((a,b) => a.name.localeCompare(b.name));
+  let idle = 0, busy = 0, unresponsive = 0;
+  let html = '';
+  for (const w of entries) {
+    const st = w.status || 'idle';
+    if (st === 'idle') idle++;
+    else if (st === 'busy') busy++;
+    if (st === 'unresponsive') unresponsive++;
+    html += '<div class="worker-card ' + st + '">'
+      + '<div class="name">' + esc(w.name) + '</div>'
+      + '<span class="status-badge ' + st + '">' + st + '</span>'
+      + '<div class="meta">' + (w.completions||0) + ' tasks | ' + ago(w.last_completed_at) + '</div>'
+      + (w.current_task ? '<div class="task-preview">Task: ' + esc(w.current_task) + '</div>' : '')
+      + '</div>';
+  }
+  grid.innerHTML = html || '<div style="color:var(--dim)">No workers registered</div>';
+  document.getElementById('stat-idle').textContent = idle;
+  document.getElementById('stat-busy').textContent = busy;
+  document.getElementById('stat-unresponsive').textContent = unresponsive;
+}
+
+function renderTasks(tasks) {
+  const body = document.getElementById('task-body');
+  const sorted = tasks.sort((a,b) => (b.created_at||0) - (a.created_at||0));
+  let pending = 0, completed = 0, failed = 0;
+  let html = '';
+  for (const t of sorted.slice(0, 50)) {
+    if (t.status === 'pending') pending++;
+    else if (t.status === 'completed') completed++;
+    else if (t.status === 'failed') failed++;
+    const dur = duration(t.dispatched_at || t.created_at, t.completed_at);
+    html += '<tr>'
+      + '<td style="font-family:monospace;font-size:12px">' + esc(t.id) + '</td>'
+      + '<td><span class="task-status ' + t.status + '">' + t.status + '</span></td>'
+      + '<td class="task-prompt" title="' + esc(t.prompt) + '">' + esc((t.prompt||'').slice(0,80)) + '</td>'
+      + '<td>' + esc(t.worker||'-') + '</td>'
+      + '<td>' + dur + '</td>'
+      + '<td class="task-output" title="' + esc(t.output) + '">' + esc((t.output||'').slice(0,100)) + '</td>'
+      + '</tr>';
+  }
+  body.innerHTML = html || '<tr><td colspan="6" style="color:var(--dim);text-align:center">No tasks yet</td></tr>';
+  document.getElementById('stat-pending').textContent = pending;
+  document.getElementById('stat-completed').textContent = completed;
+  document.getElementById('stat-failed').textContent = failed;
+}
+
+function renderHeartbeats(heartbeats) {
+  const container = document.getElementById('hb-timeline');
+  const entries = Object.entries(heartbeats).sort((a,b) => a[0].localeCompare(b[0]));
+  if (!entries.length) {
+    container.innerHTML = '<div style="color:var(--dim);font-size:12px">No heartbeats received yet</div>';
+    return;
+  }
+  const now = Date.now() / 1000;
+  let html = '';
+  for (const [name, hb] of entries) {
+    const age = now - (hb.received_at || 0);
+    const status = age > 120 ? 'silent' : (hb.task ? 'active' : 'idle');
+    const pct = Math.min(100, Math.max(5, 100 - (age / 300) * 100));
+    html += '<div class="hb-row">'
+      + '<div class="label">' + esc(name) + '</div>'
+      + '<div class="hb-bar"><div class="hb-segment ' + status + '" style="width:' + pct + '%;right:0"></div></div>'
+      + '<div class="hb-age">' + ago(hb.received_at) + '</div>'
+      + '</div>';
+  }
+  container.innerHTML = html;
+}
+
+function renderEvents(events) {
+  const feed = document.getElementById('event-feed');
+  let html = '';
+  for (const e of events.slice(-50).reverse()) {
+    const ts = new Date((e.timestamp||0) * 1000);
+    const timeStr = ts.toLocaleTimeString('en-US', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    const type = e.type || 'unknown';
+    let detail = '';
+    if (e.task_id) detail += 'task:' + e.task_id + ' ';
+    if (e.worker) detail += 'worker:' + e.worker + ' ';
+    if (e.prompt) detail += e.prompt.slice(0, 60);
+    if (e.error) detail += 'err: ' + e.error.slice(0, 60);
+    html += '<div class="entry">'
+      + '<span class="ts">' + timeStr + '</span>'
+      + '<span class="etype ' + type + '">' + type + '</span>'
+      + '<span class="detail">' + esc(detail) + '</span>'
+      + '</div>';
+  }
+  feed.innerHTML = html || '<div style="color:var(--dim)">No events yet</div>';
+}
+
+function renderCosts(costs, autoscale) {
+  document.getElementById('cost-hourly').textContent = '$' + (costs.hourly_cost_usd||0).toFixed(3);
+  const daily = costs.daily_estimate_usd || 0;
+  const budget = costs.budget_daily_usd || 50;
+  const dailyEl = document.getElementById('cost-daily');
+  dailyEl.textContent = '$' + daily.toFixed(2);
+  dailyEl.style.color = daily > budget ? 'var(--red)' : daily > budget * 0.8 ? 'var(--yellow)' : 'var(--green)';
+  document.getElementById('cost-workers').textContent = costs.running_workers || 0;
+  document.getElementById('cost-budget').textContent = '$' + budget;
+  document.getElementById('cost-hardstop').textContent = '$' + (costs.budget_hard_stop_usd || 100);
+  document.getElementById('cost-per-task').textContent = '$' + (costs.cost_per_task_usd||0).toFixed(3);
+  if (autoscale) {
+    const sEl = document.getElementById('autoscale-status');
+    sEl.textContent = autoscale.enabled ? 'ON' : 'OFF';
+    sEl.style.color = autoscale.enabled ? 'var(--green)' : 'var(--dim)';
+    document.getElementById('autoscale-min').textContent = autoscale.min_workers || 2;
+    document.getElementById('autoscale-max').textContent = autoscale.max_workers || 10;
+    const aEl = document.getElementById('autoscale-action');
+    const st = autoscale.current_state || {};
+    if (st.would_scale_up) aEl.textContent = 'Scale-up needed';
+    else if (st.would_scale_down) aEl.textContent = 'Scale-down eligible';
+    else aEl.textContent = '';
+  }
+}
+
+function setConnected(ok) {
+  document.getElementById('conn-dot').className = 'conn-indicator ' + (ok ? 'connected' : 'disconnected');
+  document.getElementById('conn-text').textContent = ok ? 'Connected' : 'Disconnected';
+}
+
+async function poll() {
+  try {
+    const [workers, tasks, heartbeats, events, costs, autoscale] = await Promise.all([
+      fetch(API_BASE + '/workers').then(r => r.json()),
+      fetch(API_BASE + '/tasks').then(r => r.json()),
+      fetch(API_BASE + '/heartbeats').then(r => r.json()),
+      fetch(API_BASE + '/events').then(r => r.json()),
+      fetch(API_BASE + '/costs').then(r => r.json()),
+      fetch(API_BASE + '/autoscale').then(r => r.json()).catch(() => null),
+    ]);
+    renderWorkers(workers);
+    renderTasks(tasks);
+    renderHeartbeats(heartbeats);
+    renderEvents(events);
+    renderCosts(costs, autoscale);
+    document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    setConnected(true);
+  } catch (e) { setConnected(false); }
+}
+
+function connectSSE() {
+  const es = new EventSource(API_BASE + '/events/stream');
+  es.onopen = function() { setConnected(true); };
+  es.onmessage = function() { poll(); };
+  es.onerror = function() { setConnected(false); es.close(); setTimeout(connectSSE, 5000); };
+}
+
+poll();
+setInterval(poll, 5000);
+connectSSE();
+</script>
+</body>
+</html>
